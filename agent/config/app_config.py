@@ -1,0 +1,10 @@
+APP_NAME = "HIA"
+APP_DESCRIPTION = "Your Personal Health Insights Agent"
+APP_ICON = "🩺"
+APP_TAGLINE = "Discover a Healthier You with AI"
+
+MAX_UPLOAD_SIZE_MB = 20
+MAX_PDF_PAGES = 50
+SESSION_TIMEOUT_MINUTES = 30
+ANALYSIS_DAILY_LIMIT = 15
+AWS_REGION = "us-east-1"
