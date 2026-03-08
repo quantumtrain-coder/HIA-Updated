@@ -1,11 +1,16 @@
-"""HIA Frontend - Streamlit UI that calls AgentCore Runtime agent."""
+"""HIA Frontend - Streamlit UI with DynamoDB + Bedrock (standalone or AgentCore)."""
 
 import streamlit as st
 import boto3
 import json
 import os
+import uuid
+import hashlib
+import hmac
 import pdfplumber
 from io import BytesIO
+from datetime import datetime, timezone
+from boto3.dynamodb.conditions import Key
 
 st.set_page_config(page_title="HIA - Health Insights Agent", page_icon="🩺", layout="wide")
 
@@ -13,12 +18,59 @@ REGION = os.environ.get("AWS_REGION", "us-east-1")
 AGENT_ARN = os.environ.get("AGENTCORE_RUNTIME_ARN", "")
 
 
-def invoke_agent(action, **kwargs):
-    """Call the AgentCore Runtime agent."""
-    payload = {"action": action, **kwargs}
+# --- Direct DynamoDB + Bedrock for local/standalone mode ---
 
+@st.cache_resource
+def get_dynamodb():
+    return boto3.resource("dynamodb", region_name=REGION)
+
+@st.cache_resource
+def get_bedrock():
+    return boto3.client("bedrock-runtime", region_name=REGION)
+
+
+def _hash_password(password, salt=None):
+    if salt is None:
+        salt = os.urandom(32).hex()
+    hashed = hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), 100000).hex()
+    return f"{salt}:{hashed}"
+
+
+def _verify_password(password, stored_hash):
+    salt, expected = stored_hash.split(":")
+    actual = hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), 100000).hex()
+    return hmac.compare_digest(expected, actual)
+
+
+def _bedrock_generate(system_prompt, user_content):
+    """Call Bedrock with model fallback."""
+    client = get_bedrock()
+    models = [
+        "us.anthropic.claude-3-5-sonnet-20241022-v2:0",
+        "us.anthropic.claude-3-5-haiku-20241022-v1:0",
+    ]
+    for model_id in models:
+        try:
+            body = json.dumps({
+                "anthropic_version": "bedrock-2023-05-31",
+                "max_tokens": 2048,
+                "temperature": 0.7,
+                "system": system_prompt,
+                "messages": [{"role": "user", "content": user_content}],
+            })
+            resp = client.invoke_model(modelId=model_id, body=body)
+            result = json.loads(resp["body"].read())
+            return {"success": True, "content": result["content"][0]["text"], "model_used": model_id}
+        except Exception as e:
+            continue
+    return {"success": False, "error": "All models failed"}
+
+
+def invoke_agent(action, **kwargs):
+    """Route to AgentCore Runtime or handle locally with DynamoDB."""
     # If AgentCore ARN is set, use AgentCore Runtime
     if AGENT_ARN:
+        payload = {"action": action, **kwargs}
         client = boto3.client("bedrock-agentcore", region_name=REGION)
         response = client.invoke_agent_runtime(
             agentRuntimeArn=AGENT_ARN,
@@ -27,15 +79,94 @@ def invoke_agent(action, **kwargs):
         )
         body = json.loads(response["response"].read())
         return body.get("output", body)
-    else:
-        # Local mode: call agent directly via HTTP
-        import requests
-        resp = requests.post(
-            "http://localhost:8080/invocations",
-            json={"input": payload},
-            timeout=120,
-        )
-        return resp.json().get("output", resp.json())
+
+    # --- Local/standalone mode: DynamoDB direct ---
+    db = get_dynamodb()
+
+    if action == "signup":
+        table = db.Table("hia_users")
+        # Check existing
+        resp = table.query(IndexName="email-index", KeyConditionExpression=Key("email").eq(kwargs["email"]))
+        if resp.get("Items"):
+            return {"success": False, "error": "Email already registered"}
+        user_id = str(uuid.uuid4())
+        now = datetime.now(timezone.utc).isoformat()
+        table.put_item(Item={
+            "user_id": user_id, "email": kwargs["email"],
+            "name": kwargs["name"], "password_hash": _hash_password(kwargs["password"]),
+            "created_at": now,
+        })
+        return {"success": True, "data": {"id": user_id, "email": kwargs["email"], "name": kwargs["name"]}}
+
+    if action == "login":
+        table = db.Table("hia_users")
+        resp = table.query(IndexName="email-index", KeyConditionExpression=Key("email").eq(kwargs["email"]))
+        items = resp.get("Items", [])
+        if not items:
+            return {"success": False, "error": "User not found"}
+        user = items[0]
+        if not _verify_password(kwargs["password"], user["password_hash"]):
+            return {"success": False, "error": "Invalid password"}
+        return {"success": True, "data": {"id": user["user_id"], "email": user["email"], "name": user["name"]}}
+
+    if action == "create_session":
+        table = db.Table("hia_sessions")
+        sid = str(uuid.uuid4())
+        now = datetime.now(timezone.utc)
+        title = kwargs.get("title") or f"{now.strftime('%d-%m-%Y')} | {now.strftime('%H:%M:%S')}"
+        item = {"session_id": sid, "user_id": kwargs["user_id"], "title": title, "created_at": now.isoformat()}
+        table.put_item(Item=item)
+        return {"success": True, "session": {"id": sid, **item}}
+
+    if action == "list_sessions":
+        table = db.Table("hia_sessions")
+        resp = table.query(IndexName="user_id-index", KeyConditionExpression=Key("user_id").eq(kwargs["user_id"]))
+        sessions = sorted(resp.get("Items", []), key=lambda x: x.get("created_at", ""), reverse=True)
+        return {"success": True, "sessions": sessions}
+
+    if action == "delete_session":
+        sid = kwargs["session_id"]
+        msg_table = db.Table("hia_messages")
+        msgs = msg_table.query(KeyConditionExpression=Key("session_id").eq(sid))
+        with msg_table.batch_writer() as batch:
+            for m in msgs.get("Items", []):
+                batch.delete_item(Key={"session_id": m["session_id"], "created_at": m["created_at"]})
+        db.Table("hia_sessions").delete_item(Key={"session_id": sid})
+        return {"success": True}
+
+    if action == "get_messages":
+        table = db.Table("hia_messages")
+        resp = table.query(KeyConditionExpression=Key("session_id").eq(kwargs["session_id"]))
+        return {"success": True, "messages": resp.get("Items", [])}
+
+    if action == "analyze":
+        from config.prompts import SPECIALIST_PROMPTS
+        system_prompt = SPECIALIST_PROMPTS["comprehensive_analyst"]
+        data = f"Patient: {kwargs.get('patient_name')}, Age: {kwargs.get('age')}, Gender: {kwargs.get('gender')}\n\nReport:\n{kwargs.get('report', '')}"
+        result = _bedrock_generate(system_prompt, data)
+        if result["success"] and kwargs.get("session_id"):
+            table = db.Table("hia_messages")
+            now = datetime.now(timezone.utc).isoformat()
+            table.put_item(Item={"session_id": kwargs["session_id"], "created_at": now, "message_id": str(uuid.uuid4()), "content": data[:500], "role": "user"})
+            now2 = datetime.now(timezone.utc).isoformat()
+            table.put_item(Item={"session_id": kwargs["session_id"], "created_at": now2, "message_id": str(uuid.uuid4()), "content": result["content"], "role": "assistant"})
+        return {"success": result["success"], "analysis": result.get("content"), "model_used": result.get("model_used"), "error": result.get("error")}
+
+    if action == "chat":
+        system_prompt = "You are a medical assistant. Use the report context to answer questions. Be concise."
+        context = kwargs.get("context", "")
+        query = kwargs.get("query", "")
+        user_msg = f"Report Context:\n{context[:8000]}\n\nQuestion: {query}" if context else f"Question: {query}"
+        result = _bedrock_generate(system_prompt, user_msg)
+        if result["success"] and kwargs.get("session_id"):
+            table = db.Table("hia_messages")
+            now = datetime.now(timezone.utc).isoformat()
+            table.put_item(Item={"session_id": kwargs["session_id"], "created_at": now, "message_id": str(uuid.uuid4()), "content": query, "role": "user"})
+            now2 = datetime.now(timezone.utc).isoformat()
+            table.put_item(Item={"session_id": kwargs["session_id"], "created_at": now2, "message_id": str(uuid.uuid4()), "content": result["content"], "role": "assistant"})
+        return {"success": result["success"], "response": result.get("content"), "error": result.get("error")}
+
+    return {"success": False, "error": f"Unknown action: {action}"}
 
 
 def extract_pdf_text(uploaded_file):
