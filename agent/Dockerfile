@@ -1,13 +1,11 @@
 # ARM64 container for AgentCore Runtime
-FROM --platform=linux/arm64 ghcr.io/astral-sh/uv:python3.11-bookworm-slim
+FROM --platform=linux/arm64 python:3.11-slim-bookworm
 
 WORKDIR /app
 
-# Copy dependency files
-COPY pyproject.toml uv.lock* requirements.txt ./
-
-# Install dependencies
-RUN uv pip install --system -r requirements.txt
+# Copy and install dependencies
+COPY requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application code
 COPY . .
